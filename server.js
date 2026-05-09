@@ -1,7 +1,7 @@
 // ============================================================
 //  ConcertRadar — Backend
-//  Wgraj ten folder na Railway.app (przez GitHub)
-//  Ustaw zmienną środowiskową: SERP_API_KEY = twój klucz z serpapi.com
+//  Wgraj ten plik na GitHub (zastąp poprzedni server.js)
+//  Zmienna środowiskowa na Railway: SERP_API_KEY
 // ============================================================
 
 const express = require('express');
@@ -14,59 +14,74 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ── Klucz SerpAPI — ustaw w Railway jako zmienną środowiskową ──
 const SERP_API_KEY = process.env.SERP_API_KEY || 'WKLEJ_TUTAJ_KLUCZ_NA_TESTY';
 
+// ── Pomocnicze: aktualna data do filtrowania ───────────────────
+function getDateFilter() {
+  const today = new Date();
+  const year  = today.getFullYear();
+  const month = String(today.getMonth() + 1).padStart(2, '0');
+  const day   = String(today.getDate()).padStart(2, '0');
+  return { year, month, day, filter: `after:${year}-${month}-${day}` };
+}
+
 // ── Pomocnicze: wywołanie SerpAPI ──────────────────────────────
-async function serpSearch(query, extraParams = {}) {
+async function serpFetch(query, extra = {}) {
   const params = new URLSearchParams({
-    q: query,
+    q:       query,
     api_key: SERP_API_KEY,
-    hl: 'pl',
-    gl: 'pl',
-    num: '10',
-    ...extraParams,
+    hl:      'pl',
+    gl:      'pl',
+    num:     '10',
+    ...extra,
   });
-  const url = `https://serpapi.com/search?${params}`;
-  const res  = await fetch(url);
+  const res = await fetch(`https://serpapi.com/search?${params}`);
   return res.json();
 }
 
+// ── Parsowanie Google Events ───────────────────────────────────
+function parseEvents(data, todayDate) {
+  const events = data.events_results || [];
+  return events
+    .filter(e => {
+      const dateStr = e.date?.start_date || e.date?.when || '';
+      if (!dateStr) return true;
+      // Spróbuj odfiltrować przeszłe daty
+      const parsed = new Date(dateStr);
+      if (!isNaN(parsed)) return parsed >= todayDate;
+      return true;
+    })
+    .map(e => ({
+      title:   e.title            || '',
+      date:    e.date?.start_date || e.date?.when || '',
+      venue:   e.venue            || '',
+      address: Array.isArray(e.address) ? e.address[0] : (e.address || ''),
+      link:    e.link             || '',
+      source:  'Google Events',
+    }));
+}
+
 // ── Parsowanie wyników organicznych ───────────────────────────
-function parseOrganicResults(data, source) {
+function parseOrganic(data, source) {
   const results = data.organic_results || [];
   return results.slice(0, 5).map(r => ({
-    title:     r.title   || '',
-    snippet:   r.snippet || '',
-    link:      r.link    || '',
-    source:    source,
-    rawDate:   r.date    || null,
+    title:   r.title   || '',
+    snippet: r.snippet || '',
+    link:    r.link    || '',
+    source,
+    rawDate: r.date    || null,
   }));
 }
 
-// ── Parsowanie Google Events ───────────────────────────────────
-function parseEvents(data) {
-  const events = data.events_results || [];
-  return events.map(e => ({
-    title:   e.title       || '',
-    date:    e.date?.start_date || e.date?.when || '',
-    venue:   e.venue       || '',
-    address: e.address?.[0] || '',
-    link:    e.link        || '',
-    source:  'Google Events',
-  }));
-}
-
-// ── Główny endpoint wyszukiwania ───────────────────────────────
+// ── Główny endpoint ────────────────────────────────────────────
 app.get('/api/concerts/:artist', async (req, res) => {
   const artist = decodeURIComponent(req.params.artist).trim();
+  if (!artist) return res.status(400).json({ error: 'Podaj nazwę artysty' });
 
-  if (!artist) {
-    return res.status(400).json({ error: 'Podaj nazwę artysty' });
-  }
+  const { year, filter, day, month } = getDateFilter();
+  const todayDate = new Date(`${year}-${month}-${day}`);
 
   try {
-    // Równoległe zapytania do różnych źródeł
     const [
       generalData,
       eventsData,
@@ -75,51 +90,48 @@ app.get('/api/concerts/:artist', async (req, res) => {
       globalData,
     ] = await Promise.allSettled([
 
-      // 1. Ogólne Google po polsku
-      serpSearch(`${artist} koncert 2025 2026 bilety`),
+      // 1. Ogólne Google — tylko wyniki po dzisiejszej dacie
+      serpFetch(`${artist} koncert bilety ${filter}`),
 
-      // 2. Google Events (wyciąga daty automatycznie)
-      serpSearch(`${artist} concert 2025 2026`, { tbm: 'evn' }),
+      // 2. Google Events — przyszłe koncerty
+      serpFetch(`${artist} concert ${year}`, { tbm: 'evn' }),
 
-      // 3. Facebook Events
-      serpSearch(`"${artist}" concert event site:facebook.com`),
+      // 3. Facebook Events — ostatnie 6 miesięcy
+      serpFetch(`"${artist}" concert event site:facebook.com`, { tbs: 'qdr:m6' }),
 
-      // 4. Polskie bileterie
-      serpSearch(`${artist} bilety koncert going.pl OR ebilet.pl OR ticketmaster.pl OR eventim.pl`),
+      // 4. Polskie bileterie — ostatnie 6 miesięcy
+      serpFetch(`${artist} bilety koncert going.pl OR ebilet.pl OR ticketmaster.pl OR eventim.pl`, { tbs: 'qdr:m6' }),
 
-      // 5. Globalne strony muzyczne
-      serpSearch(`${artist} tour dates 2025 2026 songkick OR bandsintown`),
+      // 5. Songkick / Bandsintown
+      serpFetch(`${artist} tour dates ${year} songkick OR bandsintown`),
+
     ]);
 
-    const concerts = [];
+    const events     = [];
     const rawResults = [];
 
-    // Zbierz Google Events (najbardziej ustrukturyzowane)
     if (eventsData.status === 'fulfilled') {
-      const events = parseEvents(eventsData.value);
-      events.forEach(e => concerts.push(e));
+      parseEvents(eventsData.value, todayDate).forEach(e => events.push(e));
     }
-
-    // Zbierz wyniki organiczne
     if (generalData.status === 'fulfilled') {
-      parseOrganicResults(generalData.value, 'Google').forEach(r => rawResults.push(r));
+      parseOrganic(generalData.value, 'Google').forEach(r => rawResults.push(r));
     }
     if (facebookData.status === 'fulfilled') {
-      parseOrganicResults(facebookData.value, 'Facebook').forEach(r => rawResults.push(r));
+      parseOrganic(facebookData.value, 'Facebook').forEach(r => rawResults.push(r));
     }
     if (polishData.status === 'fulfilled') {
-      parseOrganicResults(polishData.value, 'Bileteria PL').forEach(r => rawResults.push(r));
+      parseOrganic(polishData.value, 'Bileteria PL').forEach(r => rawResults.push(r));
     }
     if (globalData.status === 'fulfilled') {
-      parseOrganicResults(globalData.value, 'Songkick/Bandsintown').forEach(r => rawResults.push(r));
+      parseOrganic(globalData.value, 'Songkick / Bandsintown').forEach(r => rawResults.push(r));
     }
 
     res.json({
       artist,
       searchedAt:  new Date().toISOString(),
-      events:      concerts,      // ustrukturyzowane Google Events
-      rawResults,                 // linki ze snippetami do dalszego przeglądania
-      totalFound:  concerts.length + rawResults.length,
+      events,
+      rawResults,
+      totalFound:  events.length + rawResults.length,
     });
 
   } catch (err) {
@@ -130,7 +142,7 @@ app.get('/api/concerts/:artist', async (req, res) => {
 
 // ── Health check ───────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ConcertRadar API działa ✅', version: '1.0.0' });
+  res.json({ status: 'ConcertRadar API działa ✅', version: '1.1.0' });
 });
 
 app.listen(PORT, () => {
